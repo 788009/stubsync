@@ -5,3 +5,4 @@ mergecode.py
 merged.py
 watcher.pyw
 config.toml
+fixdb.py
