@@ -7,6 +7,8 @@ from abc import ABC, abstractmethod
 from utils import RateLimiter
 import ftplib
 from datetime import datetime, timezone
+import io
+import tempfile
 
 # 尝试导入 paramiko
 try:
@@ -27,6 +29,10 @@ class TransferStrategy(ABC):
     def list_files(self, remote_path) -> dict: pass
     @abstractmethod
     def download(self, items, temp_dir, callback=None, stop_signal=None) -> list: pass
+    @abstractmethod
+    def read_remote_file(self, remote_path) -> str: pass
+    @abstractmethod
+    def write_remote_file(self, remote_path, content) -> bool: pass
 
 class AdbStrategy(TransferStrategy):
     def connect(self):
@@ -37,10 +43,7 @@ class AdbStrategy(TransferStrategy):
     def disconnect(self): pass
 
     def list_files(self, remote_path):
-        # 【修改前】
-        # cmd = ['adb', 'shell', 'stat', '-c', "'%Y/%F/%s/%n'", f"{remote_path}/*"]
-        
-        # 【修改后】使用 shlex.quote 包裹路径，防止空格截断
+        # 使用 shlex.quote 包裹路径，防止空格截断
         # shlex.quote("/path/with space") -> "'/path/with space'"
         # 我们需要让 * 在引号外面，以便 shell 进行通配符展开
         safe_path = shlex.quote(remote_path)
@@ -91,6 +94,53 @@ class AdbStrategy(TransferStrategy):
         except Exception as e:
             logger.error(f"ADB Download Error: {e}")
             return []
+        
+    def read_remote_file(self, remote_path):
+        # 'exec-out' 相比 'shell' 的优势是它输出的是原始二进制数据，
+        # 不会进行任何行尾转换 (CRLF) 或终端字符处理。
+        cmd = ['adb', 'exec-out', f"cat {shlex.quote(remote_path)}"]
+        try:
+            # 获取原始 bytes
+            res = subprocess.run(cmd, capture_output=True)
+            if res.returncode != 0:
+                return None
+            
+            # 尝试解码为 utf-8 字符串
+            content = res.stdout
+            if not content: return None
+            return content.decode('utf-8').strip()
+        except Exception: 
+            return None
+
+    def write_remote_file(self, remote_path, content):
+        # 创建一个临时本地文件
+        # delete=False 是为了兼容 Windows (Windows 下打开的文件无法被其他进程读取/传输)
+        tmp_fd, tmp_path = tempfile.mkstemp()
+        try:
+            # 1. 写入内容到本地临时文件
+            with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            # 2. 使用 adb push 上传
+            # 这比 `echo >` 强在：
+            # A. 处理特殊字符绝对安全
+            # B. 权限处理更标准
+            # C. 适用于任何大小的文件
+            cmd = ['adb', 'push', tmp_path, remote_path]
+            res = subprocess.run(cmd, capture_output=True)
+            
+            if res.returncode == 0:
+                return True
+            else:
+                logger.error(f"[ADB] Push failed: {res.stderr.decode().strip()}")
+                return False
+        except Exception as e:
+            logger.error(f"[ADB] Write error: {e}")
+            return False
+        finally:
+            # 3. 清理临时文件
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
 class SshStrategy(TransferStrategy):
     def __init__(self, config):
@@ -188,6 +238,23 @@ class SshStrategy(TransferStrategy):
             if stdout.channel.recv_exit_status() == 0: return [temp_tar_path]
             return []
         except Exception: return []
+
+    def read_remote_file(self, remote_path):
+        try:
+            # 使用 sftp 打开读取
+            with self.sftp.open(remote_path, 'r') as f:
+                return f.read().decode('utf-8').strip()
+        except IOError: return None # 文件不存在
+        except Exception: return None
+
+    def write_remote_file(self, remote_path, content):
+        try:
+            with self.sftp.open(remote_path, 'w') as f:
+                f.write(content)
+            return True
+        except Exception as e:
+            logger.error(f"[SSH] Write ID failed: {e}")
+            return False
 
 class FtpStrategy(TransferStrategy):
     def __init__(self, config):
@@ -331,6 +398,23 @@ class FtpStrategy(TransferStrategy):
                 self.connect()
                     
         return paths
+    
+    def read_remote_file(self, remote_path):
+        out_bytes = io.BytesIO()
+        try:
+            self.ftp.retrbinary(f"RETR {remote_path}", out_bytes.write)
+            return out_bytes.getvalue().decode('utf-8').strip()
+        except ftplib.error_perm: return None # 550 File not found
+        except Exception: return None
+
+    def write_remote_file(self, remote_path, content):
+        in_bytes = io.BytesIO(content.encode('utf-8'))
+        try:
+            self.ftp.storbinary(f"STOR {remote_path}", in_bytes)
+            return True
+        except Exception as e:
+            logger.error(f"[FTP] Write ID failed: {e}")
+            return False
 
 STRATEGY_MAP = {
     'adb': AdbStrategy,

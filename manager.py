@@ -228,10 +228,10 @@ class BackupManager:
                                     success_meta_to_db.append(meta)
                                 else:
                                     # 极其罕见：tar 包里居然没这个文件？
-                                    logger.warning(f"文件丢失: {name} 未在 tar 包中发现")
+                                    print(f"文件丢失: {name} 未在 tar 包中发现")
                                     self.stats.add_failed(1) # 修正统计
                     except Exception as e:
-                        logger.error(f"解压失败: {e}")
+                        print(f"解压失败: {e}")
                         # 整个包都挂了，一个都不写数据库
                         self.stats.add_failed(len(meta_info))
 
@@ -251,7 +251,7 @@ class BackupManager:
                                 success_meta_to_db.append(meta_map[fname])
                                 
                         except Exception as e:
-                            logger.error(f"移动文件失败 {fname}: {e}")
+                            print(f"移动文件失败 {fname}: {e}")
                             self.stats.add_failed(1)
 
                 # 4. 最终：只有真正落地的文件，才更新数据库
@@ -259,7 +259,7 @@ class BackupManager:
                     self.db.update_batch(success_meta_to_db)
                 
             except Exception as e:
-                logger.error(f"消费者处理批次出错: {e}")
+                print(f"消费者处理批次出错: {e}")
             finally:
                 # 清理 UUID 临时目录
                 if batch_temp_dir and batch_temp_dir.exists():
@@ -403,19 +403,109 @@ class BackupManager:
         print(f"    失败:       {s.files_failed}")
         print("#" * 60)
 
+    def _get_local_id(self):
+        """读取电脑端的 ID"""
+        id_file = self.storage_root / ".backup_id"
+        if id_file.exists():
+            return id_file.read_text(encoding='utf-8').strip()
+        return None
+
+    def _save_local_id(self, id_str):
+        """写入电脑端的 ID"""
+        id_file = self.storage_root / ".backup_id"
+        id_file.write_text(id_str, encoding='utf-8')
+
+    def verify_device_identity(self):
+        """
+        核心身份验证逻辑
+        返回 True 表示验证通过（或已自动建立信任），False 表示验证失败拒绝操作
+        """
+        if not self.strategy: return False
+
+        # 1. 获取配置的远程路径 (默认为 /sdcard/.backup_id)
+        remote_id_path = self.config.get('device', {}).get('remote_id_path', '/sdcard/.backup_id')
+        
+        # 2. 读取两端 ID
+        local_id = self._get_local_id()
+        remote_id = self.strategy.read_remote_file(remote_id_path)
+        
+        print(f"Identity Check | Local: {local_id} | Remote: {remote_id}")
+
+        # ---------------------------------------------------------
+        # 场景 A: 两边都没有 ID -> 首次初始化
+        # ---------------------------------------------------------
+        if not local_id and not remote_id:
+            print("检测到首次运行，正在生成新设备 ID...")
+            new_id = uuid.uuid4().hex
+            
+            # 尝试写入两端
+            if self.strategy.write_remote_file(remote_id_path, new_id):
+                self._save_local_id(new_id)
+                print(f"身份初始化成功！UUID: {new_id}")
+                return True
+            else:
+                print("无法写入手机端 ID 文件，请检查权限。")
+                return False
+
+        # ---------------------------------------------------------
+        # 场景 B: 手机有 ID，电脑没有 -> 信任手机 (新电脑/新目录接入旧手机)
+        # ---------------------------------------------------------
+        if not local_id and remote_id:
+            # 安全检查：如果本地没有 ID 文件，但数据库却很大，说明可能是配置丢失，需谨慎
+            if self.db_file.exists() and self.db_file.stat().st_size > 10240:
+                print("警告：本地存在数据库但没有 ID 文件。")
+                print("为防止数据混淆，拒绝自动信任。请手动确认或删除本地数据库。")
+                return False
+            
+            print(f"检测到远程设备 ID ({remote_id})，本地未配置，建立信任...")
+            self._save_local_id(remote_id)
+            return True
+
+        # ---------------------------------------------------------
+        # 场景 C: 电脑有 ID，手机没有 -> 拒绝 (防止误连新设备覆盖旧备份)
+        # ---------------------------------------------------------
+        if local_id and not remote_id:
+            print("严重错误：本地已有备份记录，但远程设备没有 ID 文件！")
+            print("  可能原因 1: 连接到了错误的设备/新设备。")
+            print("  可能原因 2: 手机端 ID 文件被误删。")
+            print("  --> 为保护现有备份，操作已中止。")
+            print(f"  (若确认是同一设备，请手动在手机创建文件 {remote_id_path} 内容为: {local_id})")
+            return False
+
+        # ---------------------------------------------------------
+        # 场景 D: 两边都有 ID -> 正常核对
+        # ---------------------------------------------------------
+        if local_id == remote_id:
+            print("设备身份验证通过。")
+            return True
+        else:
+            print("FATAL: 设备身份不匹配！")
+            print(f"  本地期望: {local_id}")
+            print(f"  远程实际: {remote_id}")
+            return False
+
     def run(self):
+        # 1. 选择策略并连接
         if not self.strategy: return
-        print(f"正在启动备份... (流量限制: {format_bytes(self.max_bytes) if self.max_bytes > 0 else '无限制'})")
+        
         try:
+            # 2. 身份验证环节
+            # 这里我们把验证放在 try 块里，确保出错能打印
+            if not self.verify_device_identity():
+                print("身份验证失败，程序退出。")
+                return
+
+            print(f"正在启动备份... (流量限制: {format_bytes(self.max_bytes) if self.max_bytes > 0 else '无限制'})")
+            
             for source in self.config['sources']:
                 if self.is_interrupted: break
                 self.sync_folder(source)
+                
         except Exception as e:
             print(f"\n严重错误: {e}")
             import traceback
             traceback.print_exc()
         finally:
             self.strategy.disconnect()
-            # 最后只用清理 temp_root 根目录即可，确保没有漏网之鱼
             if self.temp_root.exists(): shutil.rmtree(self.temp_root, ignore_errors=True)
             self.print_summary()
