@@ -10,6 +10,7 @@ import signal
 import time
 from datetime import datetime
 from pathlib import Path
+import uuid
 
 # 导入
 from utils import BackupStats, BatchProgressBar, format_bytes, format_time, logger
@@ -37,13 +38,15 @@ class BackupManager:
         self.storage_root = Path(self.config['storage_root'])
         self.data_root = self.storage_root / 'data'
         self.trash_root = self.storage_root / '_trash'
-        self.temp_dir = self.storage_root / 'temp_transfers'
+        
+        self.temp_root = self.storage_root / 'temp_transfers'
         self.db_file = self.storage_root / 'backup.db'
         
-        for p in [self.temp_dir, self.data_root]:
+        for p in [self.temp_root, self.data_root]:
             p.mkdir(parents=True, exist_ok=True)
-        if self.temp_dir.exists(): shutil.rmtree(self.temp_dir)
-        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        if self.temp_root.exists(): shutil.rmtree(self.temp_root)
+        self.temp_root.mkdir(parents=True, exist_ok=True)
 
         self.db = DatabaseManager(self.db_file)
         self.stats = BackupStats() 
@@ -120,13 +123,18 @@ class BackupManager:
             batch_num = i + 1
             batch_bytes = sum(item[1] for item in batch)
             
-            # 创建独立的进度条
+            # 1. 生成唯一的批次 ID 和临时目录
+            batch_uuid = uuid.uuid4().hex
+            batch_temp_dir = self.temp_root / batch_uuid
+            batch_temp_dir.mkdir(parents=True, exist_ok=True)
+
+            # 2. 创建进度条
             pbar = BatchProgressBar(batch_bytes, description=f"Batch {batch_num}/{total_batches}")
             
-            # 下载并传入回调
+            # 3. 下载到专属目录 (传入 batch_temp_dir)
             downloaded_files = self.strategy.download(
                 batch, 
-                self.temp_dir, 
+                batch_temp_dir, 
                 callback=pbar.update,
                 stop_signal=lambda: self.is_interrupted
             )
@@ -134,15 +142,22 @@ class BackupManager:
             # 结束进度条（换行）
             pbar.close()
 
-            if self.is_interrupted: break
+            if self.is_interrupted: 
+                # 如果中断，清理当前的临时目录
+                if batch_temp_dir.exists(): shutil.rmtree(batch_temp_dir, ignore_errors=True)
+                break
 
             if downloaded_files:
                 meta_info = [(item[4], item[0], item[1]) for item in batch]
-                download_queue.put((downloaded_files, meta_info))
                 
-                # 更新全局统计
+                # 4. 将 batch_temp_dir 也放入队列，传递给消费者清理
+                # 队列数据结构变更: (files, meta, temp_dir)
+                download_queue.put((downloaded_files, meta_info, batch_temp_dir))
+                
                 self.stats.add_copied(len(batch), batch_bytes)
             else:
+                # 如果下载全失败，立即清理临时目录
+                if batch_temp_dir.exists(): shutil.rmtree(batch_temp_dir, ignore_errors=True)
                 self.stats.add_failed(len(batch))
 
         download_queue.put(None)
@@ -152,22 +167,30 @@ class BackupManager:
         while True:
             item = download_queue.get()
             if item is None: break
-            files, meta_info = item
+            
+            files, meta_info, batch_temp_dir = item
+            
             try:
                 for f_path in files:
                     f_path = Path(f_path)
                     if self.is_interrupted:
-                        if f_path.exists(): os.remove(f_path)
                         continue
                     if f_path.name.endswith('.tar'):
-                        with tarfile.open(f_path, 'r') as tar: tar.extractall(path=local_data_dir)
-                        os.remove(f_path)
+                        # 无论 tar 在哪个子目录，都解压到 local_data_dir
+                        with tarfile.open(f_path, 'r') as tar: 
+                            tar.extractall(path=local_data_dir)
                     else:
                         dest_path = local_data_dir / f_path.name
+                        # 移动文件
                         shutil.move(str(f_path), str(dest_path))
                 self.db.update_batch(meta_info)
             except Exception: pass
-            finally: download_queue.task_done()
+            finally:
+                # 这一批处理完了，立即删除这个 UUID 临时目录，释放空间
+                if batch_temp_dir and batch_temp_dir.exists():
+                    shutil.rmtree(batch_temp_dir, ignore_errors=True)
+                
+                download_queue.task_done()
 
     def handle_sync_deletions(self, local_data_dir, keys_to_delete):
         if not keys_to_delete: return
@@ -318,5 +341,6 @@ class BackupManager:
             traceback.print_exc()
         finally:
             self.strategy.disconnect()
-            if self.temp_dir.exists(): shutil.rmtree(self.temp_dir, ignore_errors=True)
+            # 最后只用清理 temp_root 根目录即可，确保没有漏网之鱼
+            if self.temp_root.exists(): shutil.rmtree(self.temp_root, ignore_errors=True)
             self.print_summary()
