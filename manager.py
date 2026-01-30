@@ -405,14 +405,14 @@ class BackupManager:
 
     def _get_local_id(self):
         """读取电脑端的 ID"""
-        id_file = self.storage_root / ".backup_id"
+        id_file = self.storage_root / ".stubsync_id"
         if id_file.exists():
             return id_file.read_text(encoding='utf-8').strip()
         return None
 
     def _save_local_id(self, id_str):
         """写入电脑端的 ID"""
-        id_file = self.storage_root / ".backup_id"
+        id_file = self.storage_root / ".stubsync_id"
         id_file.write_text(id_str, encoding='utf-8')
 
     def verify_device_identity(self):
@@ -422,8 +422,8 @@ class BackupManager:
         """
         if not self.strategy: return False
 
-        # 1. 获取配置的远程路径 (默认为 /sdcard/.backup_id)
-        remote_id_path = self.config.get('device', {}).get('remote_id_path', '/sdcard/.backup_id')
+        # 1. 获取配置的远程路径 (默认为 /sdcard/.stubsync_id)
+        remote_id_path = self.config.get('device', {}).get('remote_id_path', '/sdcard/.stubsync_id')
         
         # 2. 读取两端 ID
         local_id = self._get_local_id()
