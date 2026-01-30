@@ -112,8 +112,7 @@ class BackupManager:
         if current_batch: yield current_batch
 
     # 生产者下载逻辑
-    def producer_download(self, download_queue: queue.Queue, files_to_pull, remote_base_folder):
-        # 将整个列表分批
+    def producer_download(self, download_queue, files_to_pull, remote_base_folder):
         batches = list(self.smart_chunker(files_to_pull, remote_base_folder))
         total_batches = len(batches)
 
@@ -123,15 +122,13 @@ class BackupManager:
             batch_num = i + 1
             batch_bytes = sum(item[1] for item in batch)
             
-            # 1. 生成唯一的批次 ID 和临时目录
             batch_uuid = uuid.uuid4().hex
             batch_temp_dir = self.temp_root / batch_uuid
             batch_temp_dir.mkdir(parents=True, exist_ok=True)
 
-            # 2. 创建进度条
             pbar = BatchProgressBar(batch_bytes, description=f"Batch {batch_num}/{total_batches}")
             
-            # 3. 下载到专属目录 (传入 batch_temp_dir)
+            # 执行下载
             downloaded_files = self.strategy.download(
                 batch, 
                 batch_temp_dir, 
@@ -139,54 +136,132 @@ class BackupManager:
                 stop_signal=lambda: self.is_interrupted
             )
             
-            # 结束进度条（换行）
             pbar.close()
 
             if self.is_interrupted: 
-                # 如果中断，清理当前的临时目录
                 if batch_temp_dir.exists(): shutil.rmtree(batch_temp_dir, ignore_errors=True)
                 break
 
-            if downloaded_files:
-                meta_info = [(item[4], item[0], item[1]) for item in batch]
+            if downloaded_files:                
+                valid_meta = []
+                actual_copied_size = 0
+                actual_copied_count = 0
                 
-                # 4. 将 batch_temp_dir 也放入队列，传递给消费者清理
-                # 队列数据结构变更: (files, meta, temp_dir)
-                download_queue.put((downloaded_files, meta_info, batch_temp_dir))
-                
-                self.stats.add_copied(len(batch), batch_bytes)
+                # 判断是 ADB Tar 包还是独立文件列表
+                # ADB 策略返回的是 [xxx.tar]，FTP/SSH 返回的是 [file1, file2...]
+                is_tar_packet = len(downloaded_files) == 1 and downloaded_files[0].name.endswith('.tar')
+
+                if is_tar_packet:
+                    # 情况 A: Tar 包模式 (ADB)
+                    # 假设 Tar 包只要生成了，里面就包含了该批次所有文件
+                    # (ADB exec-out tar 如果中途失败，通常也是全量失败或截断，较难细粒度控制，暂按全量算)
+                    valid_meta = [(item[4], item[0], item[1]) for item in batch]
+                    actual_copied_size = batch_bytes
+                    actual_copied_count = len(batch)
+                else:
+                    # 情况 B: 独立文件模式 (FTP / SSH-SFTP)
+                    # 必须过滤：只有在 downloaded_files 里存在的文件，才记录进数据库
+                    
+                    # 1. 提取所有下载成功的“文件名”
+                    downloaded_names = set(f.name for f in downloaded_files)
+                    
+                    # 2. 遍历计划批次，只保留成功的
+                    for item in batch:
+                        # item 结构: (ts, size, full_path, fname, key)
+                        fname = item[3]
+                        if fname in downloaded_names:
+                            valid_meta.append((item[4], item[0], item[1]))
+                            actual_copied_size += item[1]
+                            actual_copied_count += 1
+                        else:
+                            # 记录失败（虽然在这个批次里没报错，但没下载下来就是失败）
+                            self.stats.add_failed(1)
+
+                # 只有当有有效文件时才提交
+                if valid_meta:
+                    download_queue.put((downloaded_files, valid_meta, batch_temp_dir))
+                    self.stats.add_copied(actual_copied_count, actual_copied_size)
+                else:
+                    # 虽然 downloaded_files 不为空（可能产生了空文件），但匹配不到元数据，视为无效
+                    if batch_temp_dir.exists(): shutil.rmtree(batch_temp_dir, ignore_errors=True)
+
             else:
-                # 如果下载全失败，立即清理临时目录
+                # 整个批次全挂了
                 if batch_temp_dir.exists(): shutil.rmtree(batch_temp_dir, ignore_errors=True)
                 self.stats.add_failed(len(batch))
 
         download_queue.put(None)
 
-    def consumer_extract(self, download_queue: queue.Queue, local_data_dir):
+    def consumer_extract(self, download_queue, local_data_dir):
         if not local_data_dir.exists(): local_data_dir.mkdir(parents=True, exist_ok=True)
+        
         while True:
             item = download_queue.get()
             if item is None: break
             
+            # files: 下载成功的本地临时文件路径列表
+            # meta_info: Producer 筛选过的元数据列表 [(full_path, ts, size), ...]
+            # batch_temp_dir: 这一批次的 UUID 临时目录
             files, meta_info, batch_temp_dir = item
             
+            # 建立一个文件名到元数据的映射字典，方便查阅
+            # meta_info 的结构是 (远程路径, 时间戳, 大小)
+            # 我们需要通过 "文件名" 来关联它们
+            # 假设远程路径最后一段是文件名
+            meta_map = {Path(m[0]).name: m for m in meta_info}
+            
+            success_meta_to_db = []
+
             try:
-                for f_path in files:
-                    f_path = Path(f_path)
-                    if self.is_interrupted:
-                        continue
-                    if f_path.name.endswith('.tar'):
-                        # 无论 tar 在哪个子目录，都解压到 local_data_dir
-                        with tarfile.open(f_path, 'r') as tar: 
+                # 1. 如果是 Tar 包 (ADB 模式)
+                if len(files) == 1 and files[0].name.endswith('.tar'):
+                    tar_path = files[0]
+                    try:
+                        with tarfile.open(tar_path, 'r') as tar:
+                            # 2. 解压
                             tar.extractall(path=local_data_dir)
-                    else:
-                        dest_path = local_data_dir / f_path.name
-                        # 移动文件
-                        shutil.move(str(f_path), str(dest_path))
-                self.db.update_batch(meta_info)
-            except Exception: pass
+                            
+                            # 3. 解压后，遍历 meta_info，检查文件是否真的出现在了硬盘上
+                            for name, meta in meta_map.items():
+                                final_path = local_data_dir / name
+                                if final_path.exists():
+                                    success_meta_to_db.append(meta)
+                                else:
+                                    # 极其罕见：tar 包里居然没这个文件？
+                                    logger.warning(f"文件丢失: {name} 未在 tar 包中发现")
+                                    self.stats.add_failed(1) # 修正统计
+                    except Exception as e:
+                        logger.error(f"解压失败: {e}")
+                        # 整个包都挂了，一个都不写数据库
+                        self.stats.add_failed(len(meta_info))
+
+                # 2. 如果是散文件 (FTP/SSH 模式)
+                else:
+                    for f_path in files:
+                        f_path = Path(f_path)
+                        fname = f_path.name
+                        dest_path = local_data_dir / fname
+                        
+                        try:
+                            # 移动文件
+                            shutil.move(str(f_path), str(dest_path))
+                            
+                            # 只有移动没报错，才把这个文件的元数据加入“待写入名单”
+                            if fname in meta_map:
+                                success_meta_to_db.append(meta_map[fname])
+                                
+                        except Exception as e:
+                            logger.error(f"移动文件失败 {fname}: {e}")
+                            self.stats.add_failed(1)
+
+                # 4. 最终：只有真正落地的文件，才更新数据库
+                if success_meta_to_db:
+                    self.db.update_batch(success_meta_to_db)
+                
+            except Exception as e:
+                logger.error(f"消费者处理批次出错: {e}")
             finally:
-                # 这一批处理完了，立即删除这个 UUID 临时目录，释放空间
+                # 清理 UUID 临时目录
                 if batch_temp_dir and batch_temp_dir.exists():
                     shutil.rmtree(batch_temp_dir, ignore_errors=True)
                 
