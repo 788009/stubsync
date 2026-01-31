@@ -96,20 +96,53 @@ class AdbStrategy(TransferStrategy):
             return []
         
     def read_remote_file(self, remote_path):
-        # 'exec-out' 相比 'shell' 的优势是它输出的是原始二进制数据，
-        # 不会进行任何行尾转换 (CRLF) 或终端字符处理。
-        cmd = ['adb', 'exec-out', f"cat {shlex.quote(remote_path)}"]
+        """
+        使用带外数据验证的方式读取文件
+        原理：cat file; echo separator$?
+        这样可以准确获取远程 shell 的退出码，区分“文件不存在”和“内容为空”
+        """
+        # 定义一个足够独特的分隔符，防止和文件内容冲突
+        # 使用 bytes 类型以兼容二进制流
+        separator = b'|V|E|R|I|F|Y|'
+        separator_str = separator.decode()
+
+        # 构造命令：
+        # 1. cat 文件 (如果失败，标准错误可能会被 exec-out 丢弃或混合，主要靠 $? 判断)
+        # 2. 无论成功失败，都打印分隔符
+        # 3. 打印真实的退出码 ($?)
+        # 4. sh -c 确保整个字符串在手机端作为一个 shell 脚本执行
+        cmd_inner = f"cat {shlex.quote(remote_path)}; echo -n '{separator_str}'$?"
+        cmd = ['adb', 'exec-out', f'sh -c {shlex.quote(cmd_inner)}']
+
         try:
-            # 获取原始 bytes
             res = subprocess.run(cmd, capture_output=True)
-            if res.returncode != 0:
+            content_with_code = res.stdout
+
+            # 1. 检查是否存在分隔符
+            if separator not in content_with_code:
+                # 这种情况极其罕见，通常意味着 ADB 彻底挂了或者被 kill 了，或者 sh -c 执行失败
                 return None
-            
-            # 尝试解码为 utf-8 字符串
-            content = res.stdout
-            if not content: return None
-            return content.decode('utf-8').strip()
-        except Exception: 
+
+            # 2. 分割 内容 和 退出码
+            # rsplit 确保我们取最后出现的分隔符（防止文件内容里碰巧也有分隔符）
+            real_content, exit_code_bytes = content_with_code.rsplit(separator, 1)
+
+            try:
+                exit_code = int(exit_code_bytes.strip())
+            except ValueError:
+                return None # 解析退出码失败，视为错误
+
+            if exit_code == 0:
+                # 退出码 0 表示 cat 成功
+                # 使用 ignore 忽略可能的非 UTF-8 字符（虽然 ID 应该是纯文本）
+                return real_content.decode('utf-8', errors='ignore').strip()
+            else:
+                # 退出码非 0，表示文件不存在或无权限
+                # (此时 real_content 可能是空的，也可能是报错信息，但我们只关心结果：没有读到 ID)
+                return None
+
+        except Exception as e:
+            logger.error(f"[ADB] Read ID error: {e}")
             return None
 
     def write_remote_file(self, remote_path, content):
