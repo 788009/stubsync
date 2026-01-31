@@ -1,11 +1,10 @@
 import time
 import sys
 import threading
-import logging
+from loguru import logger
 
-# 配置日志
-logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# 预定义仅终端输出
+console_only = logger.bind(to_file=False)
 
 def format_bytes(size):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
@@ -106,13 +105,17 @@ class BatchProgressBar:
                f"{format_bytes(self.current_size)}/{format_bytes(self.total_size)} | "
                f"{format_bytes(speed)}/s | ETA: {format_time(eta)}   ")
         
-        sys.stdout.write(msg)
+        # 使用 console_only 配合 raw=True 来模拟 sys.stdout.write
+        # raw=True 会忽略格式化字符串，直接输出 msg
+        # bind(display="pbar") 是为了通过 main.py 中的过滤器 (filter=lambda r: "display" in r["extra"])
+        console_only.bind(display="pbar").opt(raw=True).info(msg)
         sys.stdout.flush()
 
     def close(self):
         # 强制打印 100% 并换行
         self._print()
-        sys.stdout.write("\n")
+        # 输出换行
+        console_only.bind(display="pbar_end").opt(raw=True).info("\n")
         sys.stdout.flush()
 
 class RateLimiter:

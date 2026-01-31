@@ -11,11 +11,15 @@ import time
 from datetime import datetime
 from pathlib import Path
 import uuid
+from loguru import logger
 
 # 导入
-from utils import BackupStats, BatchProgressBar, format_bytes, format_time, logger
+from utils import BackupStats, BatchProgressBar, format_bytes, format_time
 from database import DatabaseManager
 from strategies import STRATEGY_MAP, TransferStrategy
+
+# 预定义仅输出到终端的 Logger (用于纯 UI 展示，不记录到文件)
+console_only = logger.bind(to_file=False)
 
 try:
     import tomllib
@@ -23,7 +27,8 @@ except ImportError:
     try:
         import tomli as tomllib
     except ImportError:
-        print("Error: Keep Python >= 3.11 OR 'pip install tomli'")
+        # 这里虽然没有配置 logger，但 loguru 默认会输出到 stderr
+        logger.bind(display="Error: Keep Python >= 3.11 OR 'pip install tomli'").error("Missing required library: tomllib/tomli")
         sys.exit(1)
 
 class BackupManager:
@@ -57,7 +62,7 @@ class BackupManager:
 
     def load_config(self, path):
         if not os.path.exists(path):
-            print(f"Config not found: {path}")
+            logger.bind(display=f"Config not found: {path}").error(f"Config file missing: {path}")
             sys.exit(1)
         with open(path, 'rb') as f: self.config = tomllib.load(f)
         adv = self.config.get('advanced', {})
@@ -73,19 +78,19 @@ class BackupManager:
         modes = conn_config.get('mode', ['adb', 'ssh'])
         if isinstance(modes, str): modes = [modes]
         
-        print(f"连接策略: {' -> '.join(modes)}")
+        console_only.bind(display=f"连接策略: {' -> '.join(modes)}").info("Connection strategy sequence: {}", modes)
         for mode_name in modes:
             mode_key = mode_name.lower().strip()
             strategy_cls: TransferStrategy = STRATEGY_MAP.get(mode_key)
             if not strategy_cls: continue
             
             strategy_instance = strategy_cls(self.config)
-            print(f"正在尝试: {mode_key.upper()} ...")
+            console_only.bind(display=f"正在尝试: {mode_key.upper()} ...").info(f"Attempting connection: {mode_key}")
             if strategy_instance.connect():
-                print(f"成功连接到: {mode_key.upper()}")
+                logger.bind(display=f"成功连接到: {mode_key.upper()}").info(f"Successfully connected via {mode_key}")
                 return strategy_instance
             else:
-                print(f"{mode_key.upper()} 失败，尝试下一个...")
+                logger.bind(display=f"{mode_key.upper()} 失败，尝试下一个...").warning(f"Connection failed: {mode_key}, trying next...")
         return None
 
     def should_exclude(self, remote_full_path, filename):
@@ -229,10 +234,10 @@ class BackupManager:
                                     success_meta_to_db.append(meta)
                                 else:
                                     # 极其罕见：tar 包里居然没这个文件？
-                                    print(f"文件丢失: {name} 未在 tar 包中发现")
+                                    logger.bind(display=f"文件丢失: {name} 未在 tar 包中发现").error(f"File missing in tar: {name}")
                                     self.stats.add_failed(1) # 修正统计
                     except Exception as e:
-                        print(f"解压失败: {e}")
+                        logger.bind(display=f"解压失败: {e}").exception(f"Tar extraction failed: {e}")
                         # 整个包都挂了，一个都不写数据库
                         self.stats.add_failed(len(meta_info))
 
@@ -252,7 +257,7 @@ class BackupManager:
                                 success_meta_to_db.append(meta_map[fname])
                                 
                         except Exception as e:
-                            print(f"移动文件失败 {fname}: {e}")
+                            logger.bind(display=f"移动文件失败 {fname}: {e}").exception(f"Failed to move file {fname}: {e}")
                             self.stats.add_failed(1)
 
                 # 4. 最终：只有真正落地的文件，才更新数据库
@@ -260,7 +265,7 @@ class BackupManager:
                     self.db.update_batch(success_meta_to_db)
                 
             except Exception as e:
-                print(f"消费者处理批次出错: {e}")
+                logger.bind(display=f"消费者处理批次出错: {e}").exception(f"Consumer batch processing error: {e}")
             finally:
                 # 清理 UUID 临时目录
                 if batch_temp_dir and batch_temp_dir.exists():
@@ -346,7 +351,7 @@ class BackupManager:
                 # 检查配额
                 if self.max_bytes > 0 and (self.session_total_bytes + size) > self.max_bytes:
                     self.quota_exceeded = True
-                    print(f"\n配额已满: {fname}")
+                    logger.bind(display=f"\n配额已满: {fname}").warning(f"Quota exceeded at file: {fname}")
                     break
                 
                 self.session_total_bytes += size
@@ -358,13 +363,17 @@ class BackupManager:
         # 3. 输出文件夹信息 (只有当有变化，或者为了展示信息时才输出)
         has_changes = bool(files_to_pull or keys_to_delete)
         if has_changes or not self.only_print_changes:
-            print("\n" + "="*60)
-            print(f" 📂 正在处理目录: {remote_folder}")
-            print("-" * 60)
-            print(f"    总文件数: {folder_stats['total_remote']:<8} |  需传输: {folder_stats['transfer_count']:<8}")
-            print(f"    已跳过:   {folder_stats['skipped_count']:<8} |  需删除: {folder_stats['delete_count']:<8}")
-            print(f"    预计传输大小: {format_bytes(folder_stats['transfer_bytes'])}")
-            print("="*60)
+            msg = (
+                f"\n{'='*60}\n"
+                f" 📂 正在处理目录: {remote_folder}\n"
+                f"{'-' * 60}\n"
+                f"    总文件数: {folder_stats['total_remote']:<8} |  需传输: {folder_stats['transfer_count']:<8}\n"
+                f"    已跳过:   {folder_stats['skipped_count']:<8} |  需删除: {folder_stats['delete_count']:<8}\n"
+                f"    预计传输大小: {format_bytes(folder_stats['transfer_bytes'])}\n"
+                f"{'='*60}"
+            )
+            # 记录详细信息到日志，并显示到终端
+            logger.bind(display=msg).info(f"Syncing folder: {remote_folder} | Transfer: {folder_stats['transfer_count']} files ({format_bytes(folder_stats['transfer_bytes'])})")
 
         # 4. 开始下载
         if files_to_pull and not self.is_interrupted:
@@ -384,7 +393,7 @@ class BackupManager:
                 self.sync_folder(sub)
 
     def handle_exit(self, signum, frame):
-        print("\n\n正在停止...")
+        console_only.bind(display="\n\n正在停止...").info("Signal received, stopping...")
         self.is_interrupted = True
 
     def print_summary(self):
@@ -393,20 +402,30 @@ class BackupManager:
         elapsed = s.end_time - s.start_time
         avg_speed = s.bytes_copied / elapsed if elapsed > 0 else 0
         
-        print("\n\n" + "#"*60)
-        print(f"备份任务摘要")
-        print("-" * 60)
-        print(f"    总耗时:     {format_time(elapsed)}")
-        print(f"    平均速度:   {format_bytes(avg_speed)}/s")
-        print("-" * 60)
-        print(f"    目录扫描:   {s.dirs_total}")
-        print(f"    文件总数:   {s.files_total}")
-        print(f"    成功传输:   {s.files_copied} ({format_bytes(s.bytes_copied)})")
-        print(f"    已跳过:     {s.files_skipped} ({format_bytes(s.bytes_skipped)})")
-        print(f"    删除文件:   {s.files_deleted}")
-        print(f"    删除条目:   {s.rows_deleted}")
-        print(f"    失败:       {s.files_failed}")
-        print("#" * 60)
+        display_msg = (
+            f"\n\n{'#'*60}\n"
+            f"备份任务摘要\n"
+            f"{'-' * 60}\n"
+            f"    总耗时:     {format_time(elapsed)}\n"
+            f"    平均速度:   {format_bytes(avg_speed)}/s\n"
+            f"{'-' * 60}\n"
+            f"    目录扫描:   {s.dirs_total}\n"
+            f"    文件总数:   {s.files_total}\n"
+            f"    成功传输:   {s.files_copied} ({format_bytes(s.bytes_copied)})\n"
+            f"    已跳过:     {s.files_skipped} ({format_bytes(s.bytes_skipped)})\n"
+            f"    删除文件:   {s.files_deleted}\n"
+            f"    删除条目:   {s.rows_deleted}\n"
+            f"    失败:       {s.files_failed}\n"
+            f"{'#' * 60}"
+        )
+        
+        log_msg = (
+            f"Backup Summary | Duration: {format_time(elapsed)} | Speed: {format_bytes(avg_speed)}/s | "
+            f"Dirs: {s.dirs_total} | Files: {s.files_total} | Copied: {s.files_copied} ({format_bytes(s.bytes_copied)}) | "
+            f"Skipped: {s.files_skipped} | Deleted: {s.files_deleted} | Failed: {s.files_failed}"
+        )
+
+        logger.bind(display=display_msg).info(log_msg)
 
     def _get_local_id(self):
         """读取电脑端的 ID"""
@@ -434,22 +453,22 @@ class BackupManager:
         local_id = self._get_local_id()
         remote_id = self.strategy.read_remote_file(remote_id_path)
         
-        print(f"Identity Check | Local: {local_id} | Remote: {remote_id}")
+        logger.bind(display=f"身份验证 | 本地: {local_id} | 远程: {remote_id}").info(f"Identity Check | Local: {local_id} | Remote: {remote_id}")
 
         # ---------------------------------------------------------
         # 场景 A: 两边都没有 ID -> 首次初始化
         # ---------------------------------------------------------
         if not local_id and not remote_id:
-            print("检测到首次运行，正在生成新设备 ID...")
+            logger.bind(display="检测到首次运行，正在生成新设备 ID...").info("First run detected, generating new device ID...")
             new_id = uuid.uuid4().hex
             
             # 尝试写入两端
             if self.strategy.write_remote_file(remote_id_path, new_id):
                 self._save_local_id(new_id)
-                print(f"身份初始化成功！UUID: {new_id}")
+                logger.bind(display=f"身份初始化成功！UUID: {new_id}").info(f"Identity initialized. UUID: {new_id}")
                 return True
             else:
-                print("无法写入手机端 ID 文件，请检查权限。")
+                logger.bind(display="无法写入手机端 ID 文件，请检查权限。").error("Failed to write remote ID file. Check permissions.")
                 return False
 
         # ---------------------------------------------------------
@@ -457,12 +476,15 @@ class BackupManager:
         # ---------------------------------------------------------
         if not local_id and remote_id:
             # 安全检查：如果本地没有 ID 文件，但数据库却很大，说明可能是配置丢失，需谨慎
-            if self.db_file.exists() and self.db_file.stat().st_size > 10240:
-                print("警告：本地存在数据库但没有 ID 文件。")
-                print("为防止数据混淆，拒绝自动信任。请手动确认或删除本地数据库。")
+            if self.db_file.exists() and self.db_file.stat().st_size > 16384:
+                msg = (
+                    "警告：本地存在数据库但没有 ID 文件。\n"
+                    "为防止数据混淆，拒绝自动信任。请手动确认或删除本地数据库。"
+                )
+                logger.bind(display=msg).warning("Local DB exists without ID file. Automatic trust refused.")
                 return False
             
-            print(f"检测到远程设备 ID ({remote_id})，本地未配置，建立信任...")
+            logger.bind(display=f"检测到远程设备 ID ({remote_id})，本地未配置，建立信任...").info(f"Adopting remote ID: {remote_id}")
             self._save_local_id(remote_id)
             return True
 
@@ -470,23 +492,29 @@ class BackupManager:
         # 场景 C: 电脑有 ID，手机没有 -> 拒绝 (防止误连新设备覆盖旧备份)
         # ---------------------------------------------------------
         if local_id and not remote_id:
-            print("严重错误：本地已有备份记录，但远程设备没有 ID 文件！")
-            print("  可能原因 1: 连接到了错误的设备/新设备。")
-            print("  可能原因 2: 手机端 ID 文件被误删。")
-            print("  --> 为保护现有备份，操作已中止。")
-            print(f"  (若确认是同一设备，请手动在手机创建文件 {remote_id_path} 内容为: {local_id})")
+            msg = (
+                "严重错误：本地已有备份记录，但远程设备没有 ID 文件！\n"
+                "  可能原因 1: 连接到了错误的设备/新设备。\n"
+                "  可能原因 2: 手机端 ID 文件被误删。\n"
+                "  --> 为保护现有备份，操作已中止。\n"
+                f"  (若确认是同一设备，请手动在手机创建文件 {remote_id_path} 内容为: {local_id})"
+            )
+            logger.bind(display=msg).error(f"FATAL: Local ID exists ({local_id}) but remote is empty. Backup aborted to protect data.")
             return False
 
         # ---------------------------------------------------------
         # 场景 D: 两边都有 ID -> 正常核对
         # ---------------------------------------------------------
         if local_id == remote_id:
-            print("设备身份验证通过。")
+            console_only.bind(display="设备身份验证通过。").info("Device identity verified.")
             return True
         else:
-            print("FATAL: 设备身份不匹配！")
-            print(f"  本地期望: {local_id}")
-            print(f"  远程实际: {remote_id}")
+            msg = (
+                "FATAL: 设备身份不匹配！\n"
+                f"  本地期望: {local_id}\n"
+                f"  远程实际: {remote_id}"
+            )
+            logger.bind(display=msg).critical(f"Identity mismatch! Local: {local_id}, Remote: {remote_id}")
             return False
 
     def run(self):
@@ -497,19 +525,18 @@ class BackupManager:
             # 2. 身份验证环节
             # 这里我们把验证放在 try 块里，确保出错能打印
             if not self.verify_device_identity():
-                print("身份验证失败，程序退出。")
+                console_only.bind(display="身份验证失败，程序退出。").warning("Identity verification failed. Exiting.")
                 return
 
-            print(f"正在启动备份... (流量限制: {format_bytes(self.max_bytes) if self.max_bytes > 0 else '无限制'})")
+            start_msg = f"正在启动备份... (流量限制: {format_bytes(self.max_bytes) if self.max_bytes > 0 else '无限制'})"
+            console_only.bind(display=start_msg).info(f"Backup starting. Limit: {self.max_bytes}")
             
             for source in self.config['sources']:
                 if self.is_interrupted: break
                 self.sync_folder(source)
                 
         except Exception as e:
-            print(f"\n严重错误: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.bind(display=f"\n严重错误: {e}").exception(f"Critical error in run loop: {e}")
         finally:
             self.strategy.disconnect()
             if self.temp_root.exists(): shutil.rmtree(self.temp_root, ignore_errors=True)

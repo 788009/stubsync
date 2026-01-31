@@ -2,22 +2,24 @@ import os
 import time
 import subprocess
 import shlex
-import logging
 from abc import ABC, abstractmethod
 from utils import RateLimiter
 import ftplib
 from datetime import datetime, timezone
 import io
 import tempfile
+from loguru import logger
+
+# 预定义仅输出到终端的 Logger
+console_only = logger.bind(to_file=False)
 
 # 尝试导入 paramiko
 try:
     import paramiko
 except ImportError:
-    print("Warning: 'paramiko' not found. SSH mode will not work.")
+    # 原 print 替换为 console_only
+    console_only.bind(display="警告: 未找到 'paramiko'，SSH 模式不可用。").warning("Warning: 'paramiko' not found. SSH mode will not work.")
     paramiko = None
-
-logger = logging.getLogger(__name__)
 
 class TransferStrategy(ABC):
     def __init__(self, config): self.config = config
@@ -92,7 +94,8 @@ class AdbStrategy(TransferStrategy):
             if process.returncode == 0: return [temp_tar_path]
             return []
         except Exception as e:
-            logger.error(f"ADB Download Error: {e}")
+            # 终端中文，日志英文
+            logger.bind(display=f"ADB 下载错误: {e}").error(f"ADB Download Error: {e}")
             return []
         
     def read_remote_file(self, remote_path):
@@ -142,7 +145,7 @@ class AdbStrategy(TransferStrategy):
                 return None
 
         except Exception as e:
-            logger.error(f"[ADB] Read ID error: {e}")
+            logger.bind(display=f"ADB 读取 ID 错误: {e}").error(f"[ADB] Read ID error: {e}")
             return None
 
     def write_remote_file(self, remote_path, content):
@@ -165,10 +168,11 @@ class AdbStrategy(TransferStrategy):
             if res.returncode == 0:
                 return True
             else:
-                logger.error(f"[ADB] Push failed: {res.stderr.decode().strip()}")
+                err_msg = res.stderr.decode().strip()
+                logger.bind(display=f"ADB 上传失败: {err_msg}").error(f"[ADB] Push failed: {err_msg}")
                 return False
         except Exception as e:
-            logger.error(f"[ADB] Write error: {e}")
+            logger.bind(display=f"ADB 写入错误: {e}").error(f"[ADB] Write error: {e}")
             return False
         finally:
             # 3. 清理临时文件
@@ -203,7 +207,7 @@ class SshStrategy(TransferStrategy):
             self.sftp = self.client.open_sftp()
             return True
         except Exception as e:
-            logger.error(f"SSH Connect Error: {e}")
+            logger.bind(display=f"SSH 连接错误: {e}").error(f"SSH Connect Error: {e}")
             return False
 
     def disconnect(self):
@@ -286,7 +290,7 @@ class SshStrategy(TransferStrategy):
                 f.write(content)
             return True
         except Exception as e:
-            logger.error(f"[SSH] Write ID failed: {e}")
+            logger.bind(display=f"SSH 写入 ID 失败: {e}").error(f"[SSH] Write ID failed: {e}")
             return False
 
 class FtpStrategy(TransferStrategy):
@@ -304,20 +308,20 @@ class FtpStrategy(TransferStrategy):
         pwd = self.ftp_conf.get('password', '')
 
         if not host:
-            logger.error("[FTP] Host not configured")
+            logger.bind(display="FTP 主机未配置").error("[FTP] Host not configured")
             return False
 
         try:
             self.ftp = ftplib.FTP()
-            logger.info(f"[FTP] Connecting to {host}:{port}...")
+            logger.bind(display=f"正在连接到 {host}:{port}...").info(f"[FTP] Connecting to {host}:{port}...")
             self.ftp.connect(host, port, timeout=10)
             self.ftp.login(user, pwd)
             # 强制 UTF-8，防止中文乱码 (RFC 2640)
             self.ftp.encoding = "utf-8"
-            logger.info("[FTP] Connected.")
+            logger.bind(display="FTP 已连接。").info("[FTP] Connected.")
             return True
         except Exception as e:
-            logger.error(f"[FTP] Connection failed: {e}")
+            logger.bind(display=f"FTP 连接失败: {e}").error(f"[FTP] Connection failed: {e}")
             return False
 
     def disconnect(self):
@@ -361,22 +365,22 @@ class FtpStrategy(TransferStrategy):
         except (ftplib.error_perm, ftplib.error_temp, TimeoutError, EOFError) as e:
             # 如果是权限错误(550)，通常是真的没这个目录，无需重试
             if "550" in str(e):
-                logger.warning(f"[FTP] List failed (NoEntry): {e}")
+                logger.bind(display=f"FTP 目录获取失败 (550): {e}").warning(f"[FTP] List failed (NoEntry): {e}")
                 return {}
             
             # 其他错误（超时、断开、协议错乱），尝试重连一次
-            logger.warning(f"[FTP] List failed ({e}), reconnecting...")
+            logger.bind(display=f"FTP 列表失败 ({e})，正在重连...").warning(f"[FTP] List failed ({e}), reconnecting...")
             self.disconnect()
             if self.connect():
                 try:
                     return _do_mlsd()
                 except Exception as retry_e:
-                    logger.error(f"[FTP] Retry list failed: {retry_e}")
+                    logger.bind(display=f"FTP 重连后获取列表失败: {retry_e}").error(f"[FTP] Retry list failed: {retry_e}")
                     return {}
             else:
                 return {}
         except Exception as e:
-            logger.error(f"[FTP] Unknown list error: {e}")
+            logger.bind(display=f"FTP 未知列表错误: {e}").error(f"[FTP] Unknown list error: {e}")
             return {}
 
     def download(self, items, temp_dir, callback=None, stop_signal=None):
@@ -391,7 +395,7 @@ class FtpStrategy(TransferStrategy):
             # 2. 检查连接存活，如果上一轮断了，这里尝试补救
             if not self.ftp:
                 if not self.connect():
-                    logger.error("[FTP] Cannot reconnect, skipping batch.")
+                    logger.bind(display="FTP 无法重连，跳过批次。").error("[FTP] Cannot reconnect, skipping batch.")
                     break
 
             remote_full_path = item[2]
@@ -415,7 +419,7 @@ class FtpStrategy(TransferStrategy):
                 return paths
             except Exception as e:
                 # 遇到错误，强制重置连接
-                logger.error(f"[FTP] Download error {fname}: {e}")
+                logger.bind(display=f"FTP 下载错误 {fname}: {e}").error(f"[FTP] Download error {fname}: {e}")
                 
                 # 删除可能下载了一半的损坏文件
                 if local_path.exists():
@@ -423,7 +427,7 @@ class FtpStrategy(TransferStrategy):
                     except: pass
                 
                 # 记录日志并重连
-                logger.warning(f"[FTP] Connection tainted. Reconnecting...")
+                logger.bind(display="FTP 连接异常，正在重连...").warning(f"[FTP] Connection tainted. Reconnecting...")
                 self.disconnect()
                 # 尝试重新建立连接，以便下一个文件能成功
                 # 注意：这里我们选择跳过当前出错的文件 (continue)，
@@ -446,7 +450,7 @@ class FtpStrategy(TransferStrategy):
             self.ftp.storbinary(f"STOR {remote_path}", in_bytes)
             return True
         except Exception as e:
-            logger.error(f"[FTP] Write ID failed: {e}")
+            logger.bind(display=f"FTP 写入 ID 失败: {e}").error(f"[FTP] Write ID failed: {e}")
             return False
 
 STRATEGY_MAP = {

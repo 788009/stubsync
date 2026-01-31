@@ -9,3 +9,4 @@ fixdb.py
 .env
 out
 main.exe
+log
