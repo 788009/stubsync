@@ -20,9 +20,7 @@ def format_time(seconds):
     h, m = divmod(m, 60)
     return f"{h}:{m:02d}:{s:02d}"
 
-# ==========================================
 # 全局统计（仅用于最后 summary）
-# ==========================================
 class BackupStats:
     def __init__(self):
         self.start_time = time.time()
@@ -64,9 +62,7 @@ class BackupStats:
     def finish(self):
         self.end_time = time.time()
 
-# ==========================================
-# 新增：单批次进度条（视觉层）
-# ==========================================
+# 单批次进度条（视觉层）
 class BatchProgressBar:
     def __init__(self, total_size, description="Transmitting"):
         self.total_size = total_size
