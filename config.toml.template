@@ -105,3 +105,7 @@ batch_max_files = 100
 
 # 单次 ADB 命令行的最大字符数 (防止命令行过长溢出)
 batch_max_chars = 7000
+
+# 是否只输出发生了变化的目录/文件信息
+# 开启后，扫描到完全匹配（无变化）的目录时将保持静默
+only_print_changes = true

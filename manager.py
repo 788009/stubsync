@@ -65,6 +65,7 @@ class BackupManager:
         self.batch_max_files = adv.get('batch_max_files', 100)
         self.batch_max_chars = adv.get('batch_max_chars', 7000)
         self.delete_behavior = adv.get('delete_behavior', 'trash')
+        self.only_print_changes = adv.get('only_print_changes', False)
         if 'excludes' not in self.config: self.config['excludes'] = {}
 
     def _select_strategy(self) -> TransferStrategy | None:
@@ -353,15 +354,15 @@ class BackupManager:
         folder_stats['transfer_count'] = len(files_to_pull)
 
         # 3. 输出文件夹信息 (只有当有变化，或者为了展示信息时才输出)
-        # 如果你希望只要扫描了就输出，保留下面这段。
-        # 如果只想在有下载任务时输出，加上 if files_to_pull or keys_to_delete:
-        print("\n" + "="*60)
-        print(f" 📂 正在处理目录: {remote_folder}")
-        print("-" * 60)
-        print(f"    总文件数: {folder_stats['total_remote']:<8} |  需传输: {folder_stats['transfer_count']:<8}")
-        print(f"    已跳过:   {folder_stats['skipped_count']:<8} |  需删除: {folder_stats['delete_count']:<8}")
-        print(f"    预计传输大小: {format_bytes(folder_stats['transfer_bytes'])}")
-        print("="*60)
+        has_changes = bool(files_to_pull or keys_to_delete)
+        if has_changes or not self.only_print_changes:
+            print("\n" + "="*60)
+            print(f" 📂 正在处理目录: {remote_folder}")
+            print("-" * 60)
+            print(f"    总文件数: {folder_stats['total_remote']:<8} |  需传输: {folder_stats['transfer_count']:<8}")
+            print(f"    已跳过:   {folder_stats['skipped_count']:<8} |  需删除: {folder_stats['delete_count']:<8}")
+            print(f"    预计传输大小: {format_bytes(folder_stats['transfer_bytes'])}")
+            print("="*60)
 
         # 4. 开始下载
         if files_to_pull and not self.is_interrupted:
