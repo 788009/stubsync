@@ -60,6 +60,12 @@ class BackupManager:
         signal.signal(signal.SIGINT, self.handle_exit)
         signal.signal(signal.SIGTERM, self.handle_exit)
 
+        if sys.platform == "win32":
+            try:
+                signal.signal(signal.SIGBREAK, self.handle_exit)
+            except AttributeError:
+                pass
+
     def load_config(self, path):
         if not os.path.exists(path):
             logger.bind(display=f"Config not found: {path}").error(f"Config file missing: {path}")
@@ -122,87 +128,100 @@ class BackupManager:
         batches = list(self.smart_chunker(files_to_pull, remote_base_folder))
         total_batches = len(batches)
 
-        for i, batch in enumerate(batches):
-            if self.is_interrupted: break
-            
-            batch_num = i + 1
-            batch_bytes = sum(item[1] for item in batch)
-            
-            batch_uuid = uuid.uuid4().hex
-            batch_temp_dir = self.temp_root / batch_uuid
-            batch_temp_dir.mkdir(parents=True, exist_ok=True)
-
-            pbar = BatchProgressBar(batch_bytes, description=f"Batch {batch_num}/{total_batches}")
-            
-            # 执行下载
-            downloaded_files = self.strategy.download(
-                batch, 
-                batch_temp_dir, 
-                callback=pbar.update,
-                stop_signal=lambda: self.is_interrupted
-            )
-            
-            pbar.close()
-
-            if self.is_interrupted: 
-                if batch_temp_dir.exists(): shutil.rmtree(batch_temp_dir, ignore_errors=True)
-                break
-
-            if downloaded_files:                
-                valid_meta = []
-                actual_copied_size = 0
-                actual_copied_count = 0
+        try:
+            for i, batch in enumerate(batches):
+                if self.is_interrupted: break
                 
-                # 判断是 ADB Tar 包还是独立文件列表
-                # ADB 策略返回的是 [xxx.tar]，FTP/SSH 返回的是 [file1, file2...]
-                is_tar_packet = len(downloaded_files) == 1 and downloaded_files[0].name.endswith('.tar')
+                batch_num = i + 1
+                batch_bytes = sum(item[1] for item in batch)
+                
+                batch_uuid = uuid.uuid4().hex
+                batch_temp_dir = self.temp_root / batch_uuid
+                batch_temp_dir.mkdir(parents=True, exist_ok=True)
 
-                if is_tar_packet:
-                    # 情况 A: Tar 包模式 (ADB)
-                    # 假设 Tar 包只要生成了，里面就包含了该批次所有文件
-                    # (ADB exec-out tar 如果中途失败，通常也是全量失败或截断，较难细粒度控制，暂按全量算)
-                    valid_meta = [(item[4], item[0], item[1]) for item in batch]
-                    actual_copied_size = batch_bytes
-                    actual_copied_count = len(batch)
-                else:
-                    # 情况 B: 独立文件模式 (FTP / SSH-SFTP)
-                    # 必须过滤：只有在 downloaded_files 里存在的文件，才记录进数据库
-                    
-                    # 1. 提取所有下载成功的“文件名”
-                    downloaded_names = set(f.name for f in downloaded_files)
-                    
-                    # 2. 遍历计划批次，只保留成功的
-                    for item in batch:
-                        # item 结构: (ts, size, full_path, fname, key)
-                        fname = item[3]
-                        if fname in downloaded_names:
-                            valid_meta.append((item[4], item[0], item[1]))
-                            actual_copied_size += item[1]
-                            actual_copied_count += 1
-                        else:
-                            # 记录失败（虽然在这个批次里没报错，但没下载下来就是失败）
-                            self.stats.add_failed(1)
+                pbar = BatchProgressBar(batch_bytes, description=f"Batch {batch_num}/{total_batches}")
+                
+                # 执行下载
+                downloaded_files = self.strategy.download(
+                    batch, 
+                    batch_temp_dir, 
+                    callback=pbar.update,
+                    stop_signal=lambda: self.is_interrupted
+                )
+                
+                pbar.close()
 
-                # 只有当有有效文件时才提交
-                if valid_meta:
-                    download_queue.put((downloaded_files, valid_meta, batch_temp_dir))
-                    self.stats.add_copied(actual_copied_count, actual_copied_size)
-                else:
-                    # 虽然 downloaded_files 不为空（可能产生了空文件），但匹配不到元数据，视为无效
+                if self.is_interrupted: 
                     if batch_temp_dir.exists(): shutil.rmtree(batch_temp_dir, ignore_errors=True)
+                    break
 
-            else:
-                # 整个批次全挂了
-                if batch_temp_dir.exists(): shutil.rmtree(batch_temp_dir, ignore_errors=True)
-                self.stats.add_failed(len(batch))
+                if downloaded_files:                
+                    valid_meta = []
+                    actual_copied_size = 0
+                    actual_copied_count = 0
+                    
+                    # 判断是 ADB Tar 包还是独立文件列表
+                    # ADB 策略返回的是 [xxx.tar]，FTP/SSH 返回的是 [file1, file2...]
+                    is_tar_packet = len(downloaded_files) == 1 and downloaded_files[0].name.endswith('.tar')
 
-        download_queue.put(None)
+                    if is_tar_packet:
+                        # 情况 A: Tar 包模式 (ADB)
+                        # 假设 Tar 包只要生成了，里面就包含了该批次所有文件
+                        # (ADB exec-out tar 如果中途失败，通常也是全量失败或截断，较难细粒度控制，暂按全量算)
+                        valid_meta = [(item[4], item[0], item[1]) for item in batch]
+                        actual_copied_size = batch_bytes
+                        actual_copied_count = len(batch)
+                    else:
+                        # 情况 B: 独立文件模式 (FTP / SSH-SFTP)
+                        # 必须过滤：只有在 downloaded_files 里存在的文件，才记录进数据库
+                        
+                        # 1. 提取所有下载成功的“文件名”
+                        downloaded_names = set(f.name for f in downloaded_files)
+                        
+                        # 2. 遍历计划批次，只保留成功的
+                        for item in batch:
+                            # item 结构: (ts, size, full_path, fname, key)
+                            fname = item[3]
+                            if fname in downloaded_names:
+                                valid_meta.append((item[4], item[0], item[1]))
+                                actual_copied_size += item[1]
+                                actual_copied_count += 1
+                            else:
+                                # 记录失败（虽然在这个批次里没报错，但没下载下来就是失败）
+                                self.stats.add_failed(1)
+
+                    # 只有当有有效文件时才提交
+                    if valid_meta:
+                        download_queue.put((downloaded_files, valid_meta, batch_temp_dir))
+                        self.stats.add_copied(actual_copied_count, actual_copied_size)
+                    else:
+                        # 虽然 downloaded_files 不为空（可能产生了空文件），但匹配不到元数据，视为无效
+                        if batch_temp_dir.exists(): shutil.rmtree(batch_temp_dir, ignore_errors=True)
+
+                else:
+                    # 整个批次全挂了
+                    if batch_temp_dir.exists(): shutil.rmtree(batch_temp_dir, ignore_errors=True)
+                    self.stats.add_failed(len(batch))
+
+        finally:
+            # 无论正常结束还是抛出异常，一定发送“结束哨兵”
+            download_queue.put(None)
 
     def consumer_extract(self, download_queue, local_data_dir):
         if not local_data_dir.exists(): local_data_dir.mkdir(parents=True, exist_ok=True)
         
         while True:
-            item = download_queue.get()
+            try:
+                # 设置 0.5 秒超时，这样每 0.5 秒都有机会检查一次 self.is_interrupted
+                item = download_queue.get(timeout=0.5)
+            except queue.Empty:
+                # 如果队列空了
+                if self.is_interrupted:
+                    # 且收到了停止信号，说明生产者已经挂了，消费者也该撤了
+                    break
+                # 没信号就继续轮询
+                continue
+
             if item is None: break
             
             # files: 下载成功的本地临时文件路径列表
@@ -393,8 +412,15 @@ class BackupManager:
                 self.sync_folder(sub)
 
     def handle_exit(self, signum, frame):
-        console_only.bind(display="\n\n正在停止...").info("Signal received, stopping...")
-        self.is_interrupted = True
+        if self.is_interrupted:
+            # 如果已经是 True，说明用户按了第二次，直接强制退出
+            console_only.bind(display="\n!!! 强制退出 !!!").warning("Force quitting...")
+            # os._exit(1) 比 sys.exit(1) 更暴力，不抛出异常，直接杀掉进程，防止线程卡死
+            os._exit(1) 
+        else:
+            # 第一次按，设置标志位，等待循环结束
+            self.is_interrupted = True
+            console_only.bind(display="\n\n正在停止... (再次按下 Ctrl+C 强制退出)").info("Signal received, stopping gracefully...")
 
     def print_summary(self):
         self.stats.finish()
