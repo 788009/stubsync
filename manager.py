@@ -40,7 +40,7 @@ class BackupManager:
         self.trash_root = self.storage_root / '_trash'
         
         self.temp_root = self.storage_root / 'temp_transfers'
-        self.db_file = self.storage_root / 'backup.db'
+        self.db_file = self.storage_root / 'stub.db'
         
         for p in [self.temp_root, self.data_root]:
             p.mkdir(parents=True, exist_ok=True)
