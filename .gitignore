@@ -7,3 +7,4 @@ watcher.pyw
 config.toml
 fixdb.py
 .env
+out
