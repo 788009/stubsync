@@ -271,6 +271,7 @@ class BackupManager:
     def handle_sync_deletions(self, local_data_dir, keys_to_delete):
         if not keys_to_delete: return
         self.db.delete_batch(list(keys_to_delete))
+        self.stats.rows_deleted += len(keys_to_delete)
         rel_path = local_data_dir.relative_to(self.data_root)
         trash_dir = self.trash_root / rel_path
         if self.delete_behavior == 'trash': trash_dir.mkdir(parents=True, exist_ok=True)
@@ -281,6 +282,7 @@ class BackupManager:
                 try:
                     if self.delete_behavior == 'trash': shutil.move(str(local_file), str(trash_dir / fname))
                     else: os.remove(local_file)
+                    self.stats.files_deleted += 1
                 except: pass
 
     # 同步逻辑与信息输出
@@ -401,6 +403,8 @@ class BackupManager:
         print(f"    文件总数:   {s.files_total}")
         print(f"    成功传输:   {s.files_copied} ({format_bytes(s.bytes_copied)})")
         print(f"    已跳过:     {s.files_skipped} ({format_bytes(s.bytes_skipped)})")
+        print(f"    删除文件:   {s.files_deleted}")
+        print(f"    删除条目:   {s.rows_deleted}")
         print(f"    失败:       {s.files_failed}")
         print("#" * 60)
 

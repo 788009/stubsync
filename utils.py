@@ -31,6 +31,8 @@ class BackupStats:
         self.files_copied = 0     
         self.files_skipped = 0    
         self.files_failed = 0     
+        self.files_deleted = 0
+        self.rows_deleted = 0
         
         self.bytes_total = 0      
         self.bytes_copied = 0     
