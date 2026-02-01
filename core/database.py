@@ -1,3 +1,4 @@
+# core/database.py
 import sqlite3
 import threading
 from loguru import logger
@@ -14,12 +15,13 @@ class DatabaseManager:
                 conn.execute("PRAGMA journal_mode=WAL;")
                 conn.execute("""CREATE TABLE IF NOT EXISTS files (rel_path TEXT PRIMARY KEY, mtime INTEGER, size INTEGER)""")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_path ON files(rel_path);")
+            logger.debug(f"Database initialized at {self.db_path}")
         except Exception as e:
-            # 记录日志但不输出到终端，并抛出异常中止程序
             logger.exception(f"Database initialization failed: {e}")
             raise
 
     def get_folder_records(self, folder_prefix):
+        """获取指定文件夹下的所有文件记录"""
         search_pattern = folder_prefix + "/%"
         records = {}
         try:
@@ -31,10 +33,13 @@ class DatabaseManager:
                     if '/' not in rem: records[rem] = (m, s)
             return records
         except Exception as e:
-            logger.exception(f"Failed to retrieve folder records for {folder_prefix}: {e}")
+            logger.exception(f"Failed to retrieve folder records: {e}")
             raise
 
     def update_batch(self, meta_list):
+        """批量更新或插入记录"""
+        # meta_list: [(rel_path, mtime, size), ...]
+        if not meta_list: return
         try:
             with self.lock, sqlite3.connect(self.db_path) as conn:
                 conn.executemany("INSERT OR REPLACE INTO files VALUES (?, ?, ?)", meta_list)
@@ -43,6 +48,7 @@ class DatabaseManager:
             raise
     
     def delete_batch(self, keys):
+        """批量删除记录"""
         if not keys: return
         try:
             with self.lock, sqlite3.connect(self.db_path) as conn:
