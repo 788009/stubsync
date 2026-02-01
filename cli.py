@@ -6,26 +6,18 @@ from loguru import logger
 from pathlib import Path
 import os
 
-# 引入核心组件
 from core.manager import BackupManager
 from core.events import SyncEventListener
 from core.utils import format_bytes, format_time
 
-# --- 日志配置 ---
+# === 关键配置：移除控制台输出，只保留文件日志 ===
 logger.remove()
 logger.add(
-    "log/stubsync_cli.log",
-    rotation="5 MB",
-    retention="10 days",
-    level="DEBUG",
+    "log/stubsync_cli.log", 
+    rotation="10 MB", 
+    level="DEBUG", 
     encoding="utf-8",
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{line} - {message}"
-)
-logger.add(
-    sys.stdout,
-    level="INFO",
-    format="{message}",
-    filter=lambda record: record["extra"].get("is_console", True)
+    enqueue=True
 )
 
 class CliEventListener(SyncEventListener):
@@ -45,18 +37,18 @@ class CliEventListener(SyncEventListener):
         
         if phase == "connecting":
             mode_name = details.get('mode', 'Unknown').upper()
-            logger.info(f"正在尝试通过 {mode_name} 连接设备...")
+            print(f"正在尝试通过 {mode_name} 连接设备...")
         elif phase == "scanning":
             path = details.get('path', '未知路径') if details else '未知路径'
-            logger.info(f"正在扫描远程目录: {path}")
+            print(f"正在扫描远程目录: {path}")
         elif phase == "backup_start":
-            logger.info(">>> 开始执行备份任务")
+            print(">>> 开始执行备份任务")
         elif phase == "finished":
-            logger.info(">>> 任务流程结束")
+            print(">>> 任务流程结束")
 
     def on_device_verified(self, device_id, mode):
         self._clear_line()
-        logger.info(f"✔ 设备验证成功 | ID: {device_id[:8]}... | 模式: {mode.upper()}")
+        print(f"✔ 设备验证成功 | ID: {device_id[:8]}... | 模式: {mode.upper()}")
 
     def on_scan_finished(self, result):
         self._clear_line()
@@ -74,7 +66,7 @@ class CliEventListener(SyncEventListener):
         lines.append("-" * 60)
         
         for line in lines:
-            logger.info(line)
+            print(line)
 
     def on_progress(self, data):
         percent = (data.current / data.total * 100) if data.total > 0 else 0
@@ -96,41 +88,45 @@ class CliEventListener(SyncEventListener):
     def on_file_processed(self, filename, status):
         pass
 
-    def on_task_finished(self, stats, success):
+    def on_log(self, message, level="info"):
         self._clear_line()
-        duration = stats.duration
-        
-        logger.info("\n" + "="*40)
-        # 根据是否成功完成，显示不同的标题
-        if success:
-            logger.info(f" 任务完成汇总 (耗时: {format_time(duration)})")
-        else:
-            logger.info(f" 任务中断汇总 (已运行: {format_time(duration)})")
-            
-        logger.info("="*40)
-        logger.info(f" 扫描文件 : {stats.files_total} ({format_bytes(stats.bytes_total)})")
-        logger.info(f" 传输成功 : {stats.files_copied} ({format_bytes(stats.bytes_copied)})")
-        logger.info(f" 跳过文件 : {stats.files_skipped} ({format_bytes(stats.bytes_skipped)})")
-        if stats.files_failed > 0:
-            logger.warning(f" 传输失败 : {stats.files_failed}")
-        
-        logger.info(f" 本地删除 : {stats.files_deleted}")
-            
-        logger.info("="*40 + "\n")
+        # 简单的日志转发到屏幕
+        if level == "info":
+            pass # print(message)
+        elif level == "warning":
+            print(f"[WARNING] {message}")
+        elif level == "error":
+            print(f"[ERROR] {message}")
 
     def on_error(self, title, message, critical=False):
         self._clear_line()
         level = "CRITICAL" if critical else "ERROR"
-        logger.error(f"[{level}] {title}: {message}")
+        # 终端显示
+        print(f"[{level}] {title}: {message}")
+        # 同时记录到文件（因为这是严重错误，值得保留）
+        logger.error(f"{title}: {message}")
 
-    def on_log(self, message, level="info"):
+    def on_task_finished(self, stats, success):
         self._clear_line()
-        if level in ["error", "critical"]:
-            logger.error(message)
-        elif level == "warning":
-            logger.warning(message)
-        elif level == "info":
-            pass
+        duration = stats.duration
+        
+        print("\n" + "="*40)
+        # 根据是否成功完成，显示不同的标题
+        if success:
+            print(f" 任务完成汇总 (耗时: {format_time(duration)})")
+        else:
+            print(f" 任务中断汇总 (已运行: {format_time(duration)})")
+            
+        print("="*40)
+        print(f" 扫描文件 : {stats.files_total} ({format_bytes(stats.bytes_total)})")
+        print(f" 传输成功 : {stats.files_copied} ({format_bytes(stats.bytes_copied)})")
+        print(f" 跳过文件 : {stats.files_skipped} ({format_bytes(stats.bytes_skipped)})")
+        if stats.files_failed > 0:
+            print(f" 传输失败 : {stats.files_failed}")
+        
+        print(f" 本地删除 : {stats.files_deleted}")
+            
+        print("="*40 + "\n")
 
 def main():
     parser = argparse.ArgumentParser(description="StubSync CLI")
