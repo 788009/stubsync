@@ -85,8 +85,7 @@ class BackupManager:
                 strategy = strategy_cls(self.config, self.listener)
                 if strategy.connect():
                     self.strategy = strategy
-                    self.current_mode = mode 
-                    self.listener.on_device_verified("Unknown", mode)
+                    self.current_mode = mode
                     return True
             except Exception as e:
                 logger.error(f"Mode {mode} failed: {e}")
@@ -122,6 +121,7 @@ class BackupManager:
 
         if local_id == remote_id:
             self.listener.on_log(f"Device ID verified: {remote_id[:8]}")
+            self.listener.on_device_verified(remote_id, self.current_mode)
             return True
         else:
             self.listener.on_error("设备不匹配", f"本地ID: {local_id}\n远程ID: {remote_id}", critical=True)
