@@ -33,13 +33,7 @@ class SyncEventListener(ABC):
     def on_scan_finished(self, result: ScanResult):
         """
         目录扫描完成，汇报该目录的详细统计数据
-        """
-        pass
-
-    @abstractmethod
-    def on_scan_finished(self, total_files: int, total_size: int, local_files_count: int):
-        """
-        扫描完成，汇报统计数据
+        :param result: ScanResult 对象，包含文件数、字节数、差异等
         """
         pass
 
@@ -56,6 +50,8 @@ class SyncEventListener(ABC):
     def on_task_finished(self, stats: BackupStats, success: bool):
         """
         任务整体结束
+        :param stats: 统计数据对象
+        :param success: 任务是否完整结束（非中断）
         """
         pass
 

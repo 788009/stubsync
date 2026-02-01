@@ -85,9 +85,6 @@ class CliEventListener(SyncEventListener):
         sys.stdout.flush()
         self.progress_bar_active = True
 
-    def on_file_processed(self, filename, status):
-        pass
-
     def on_log(self, message, level="info"):
         self._clear_line()
         # 简单的日志转发到屏幕
