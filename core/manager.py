@@ -87,8 +87,12 @@ class BackupManager:
                     self.strategy = strategy
                     self.current_mode = mode
                     return True
+                logger.error(f"Mode {mode} failed")
+                self.listener.on_log(f"{mode.upper()} 连接失败", level="warning")
             except Exception as e:
-                logger.error(f"Mode {mode} failed: {e}")
+                logger.error(f"Mode {mode} failed: {e}") # 记录详细日志到文件
+                # 在 CLI 界面输出简洁的失败原因
+                self.listener.on_log(f"{mode.upper()} 连接失败: {str(e)}", level="warning")
         
         self.listener.on_error("连接失败", "所有配置的连接模式均尝试失败。", critical=True)
         return False

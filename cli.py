@@ -44,10 +44,10 @@ class CliEventListener(SyncEventListener):
         self.last_phase = phase
         
         if phase == "connecting":
-            logger.info("正在尝试连接设备...")
+            mode_name = details.get('mode', 'Unknown').upper()
+            logger.info(f"正在尝试通过 {mode_name} 连接设备...")
         elif phase == "scanning":
             path = details.get('path', '未知路径') if details else '未知路径'
-            # 用户修改：去掉了 \n
             logger.info(f"正在扫描远程目录: {path}")
         elif phase == "backup_start":
             logger.info(">>> 开始执行备份任务")
