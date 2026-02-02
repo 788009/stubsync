@@ -10,3 +10,5 @@ fixdb.py
 out
 main.exe
 log
+combine_files.py
+combined_output.txt
